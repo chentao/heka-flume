@@ -3,7 +3,9 @@ package flume
 import (
 	"./flume"
 	"fmt"
+	"git.apache.org/thrift.git/lib/go/thrift"
 	. "github.com/mozilla-services/heka/pipeline"
+	"time"
 )
 
 type FlumeOutput struct {
@@ -18,6 +20,7 @@ type FlumeOutput struct {
 	reportLock          sync.Mutex
 	boErrorChan         chan error
 	boExitChan          chan error
+	tSock               *thrift.TSocket
 }
 
 type FlumeOutputConfig struct {
@@ -49,6 +52,27 @@ func (o *FlumeOutput) Init(config interface{}) (err error) {
 	return
 }
 
+func (o *FlumeOutput) connect(addr string, timeout uint64) (err error) {
+	o.tSock, err = thrift.NewTSocketTimeout(addr, timeout*time.Millisecond)
+	if err != nil {
+		return
+	}
+	if err = o.tSock.Open(); err != nil {
+		return
+	}
+	return nil
+}
+
+func (o *FlumeOutput) disconnect() (err error) {
+	if o.tSock != nil {
+		err = o.tSock.Close()
+		if err != nil {
+			return err
+		}
+		o.tSock = nil
+	}
+}
+
 func (o *FlumeOutput) Run(or OutputRunner, h PluginHelper) (err error) {
 	var (
 		ok       = true
@@ -56,6 +80,9 @@ func (o *FlumeOutput) Run(or OutputRunner, h PluginHelper) (err error) {
 		inChan   = or.InChan()
 		outBytes []byte
 		stopChan = make(chan bool, 1)
+		e        error
+		outBatch []*thrift.ThriftFlumeEvent
+		count    int64
 	)
 
 	if or.Encoder() == nil {
@@ -78,7 +105,7 @@ func (o *FlumeOutput) Run(or OutputRunner, h PluginHelper) (err error) {
 	o.bufferedOut, err = NewBufferedOutput("output_queue", name, or, h, o.config.QueueMaxBufferSize)
 	if err != nil {
 		if err == QueueIsFull {
-			or.LogMessage("Queue capacity is already reached/")
+			or.LogMessage("Queue capacity is already reached.")
 		} else {
 			return
 		}
@@ -91,6 +118,28 @@ func (o *FlumeOutput) Run(or OutputRunner, h PluginHelper) (err error) {
 			or.LogError(e)
 		case pack, ok = <-inChan:
 			if !ok {
+
+			}
+
+			outBytes, e = or.Encode(pack)
+			pack.Recycle()
+			if e != nil {
+				or.LogError(e)
+				atomic.AddInt64(&o.dropMessageCount, 1)
+				continue
+			}
+
+			if outBytes != nil {
+				event := &thrift.ThriftFlumeEvent{
+					body: outBytes,
+				}
+				outBatch = append(outBatch, event)
+				if count++; count > o.config.BatchSize {
+					if len(outBatch) > 0 {
+
+					}
+					count = 0
+				}
 
 			}
 		}
