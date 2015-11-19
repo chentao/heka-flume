@@ -71,8 +71,10 @@ func (o *FlumeOutput) connect(addr string, timeout uint64) (err error) {
 	if err != nil {
 		return
 	}
+	var trans *thrift.TFramedTransport
+	trans = thrift.NewTFramedTransport(tSock)
 	protoFactory := thrift.NewTBinaryProtocolFactoryDefault()
-	o.tClient = flume.NewThriftSourceProtocolClientFactory(tSock, protoFactory)
+	o.tClient = flume.NewThriftSourceProtocolClientFactory(trans, protoFactory)
 	if err = o.tClient.Transport.Open(); err != nil {
 		return
 	}
