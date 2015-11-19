@@ -1,9 +1,9 @@
 package flume
 
 import (
-	"./flume"
 	"fmt"
-	"git.apache.org/thrift.git/lib/go/thrift"
+	"github.com/chentao/heka-flume/flume"
+	"github.com/chentao/thrift/lib/go/thrift"
 	. "github.com/mozilla-services/heka/pipeline"
 	"regexp"
 	"sync/atomic"
