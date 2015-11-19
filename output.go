@@ -1,11 +1,15 @@
 package flume
 
 import (
+	"errors"
 	"fmt"
 	"github.com/chentao/heka-flume/flume"
 	"github.com/chentao/thrift/lib/go/thrift"
+	"github.com/mozilla-services/heka/message"
 	. "github.com/mozilla-services/heka/pipeline"
 	"regexp"
+	"runtime"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -63,12 +67,12 @@ func (o *FlumeOutput) Init(config interface{}) (err error) {
 
 func (o *FlumeOutput) connect(addr string, timeout uint64) (err error) {
 	var tSock *thrift.TSocket
-	tSock, err = thrift.NewTSocketTimeout(addr, timeout*time.Millisecond)
+	tSock, err = thrift.NewTSocketTimeout(addr, time.Duration(timeout)*time.Millisecond)
 	if err != nil {
 		return
 	}
-	protoFactory := thrift.NewTBinaryProtocalFactoryDefault()
-	o.tClient = flume.NewThriftSourceProtocolClientFactory(o.tSock, protoFactory)
+	protoFactory := thrift.NewTBinaryProtocolFactoryDefault()
+	o.tClient = flume.NewThriftSourceProtocolClientFactory(tSock, protoFactory)
 	if err = o.tClient.Transport.Open(); err != nil {
 		return
 	}
@@ -83,6 +87,7 @@ func (o *FlumeOutput) disconnect() (err error) {
 		}
 		o.tClient.Transport = nil
 	}
+	return
 }
 
 func (o *FlumeOutput) Run(or OutputRunner, h PluginHelper) (err error) {
@@ -93,8 +98,8 @@ func (o *FlumeOutput) Run(or OutputRunner, h PluginHelper) (err error) {
 		outBytes []byte
 		stopChan = make(chan bool, 1)
 		e        error
-		outBatch []*thrift.ThriftFlumeEvent
-		count    int64
+		outBatch []*flume.ThriftFlumeEvent
+		count    int
 	)
 
 	if or.Encoder() == nil {
@@ -169,8 +174,8 @@ func (o *FlumeOutput) Run(or OutputRunner, h PluginHelper) (err error) {
 			}
 
 			if outBytes != nil {
-				event := &thrift.ThriftFlumeEvent{
-					body: outBytes,
+				event := &flume.ThriftFlumeEvent{
+					Body: outBytes,
 				}
 				outBatch = append(outBatch, event)
 				if count++; count > o.config.BatchSize {
@@ -190,17 +195,17 @@ func (o *FlumeOutput) Run(or OutputRunner, h PluginHelper) (err error) {
 func (o *FlumeOutput) sendBatch(batch []*flume.ThriftFlumeEvent) {
 	status, err := o.tClient.AppendBatch(batch)
 	if status != flume.Status_OK {
-		o.or.LogError(fmt.Sprintf("flume.AppendBatch fail, start backing: %v", err))
-		for event := range batch {
-			o.backChan <- event.body
+		o.or.LogError(fmt.Errorf("flume.AppendBatch fail, start backing: %v", err))
+		for _, event := range batch {
+			o.backChan <- event.Body
 		}
 	}
-	atomic.AddInt64(&o.processMessageCount, len(batch))
+	atomic.AddInt64(&o.processMessageCount, int64(len(batch)))
 }
 
 func (o *FlumeOutput) SendRecord(buffer []byte) (err error) {
-	event := &thrift.ThriftFlumeEvent{
-		body: buffer,
+	event := &flume.ThriftFlumeEvent{
+		Body: buffer,
 	}
 	status, err := o.tClient.Append(event)
 	if status == flume.Status_OK {
@@ -229,7 +234,7 @@ func (o *FlumeOutput) backing(stopChan chan bool) {
 				}
 			} else if err != nil {
 				o.or.LogError(err)
-				atomic.AddInt64(&o.dropMessageCount, count)
+				atomic.AddInt64(&o.dropMessageCount, 1)
 			}
 		}
 	}
