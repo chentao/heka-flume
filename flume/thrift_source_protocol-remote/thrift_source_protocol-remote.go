@@ -5,9 +5,9 @@ package main
 
 import (
 	"flag"
-	"flume"
 	"fmt"
-	"git.apache.org/thrift.git/lib/go/thrift"
+	"github.com/chentao/heka-flume/flume"
+	"github.com/chentao/thrift/lib/go/thrift"
 	"math"
 	"net"
 	"net/url"

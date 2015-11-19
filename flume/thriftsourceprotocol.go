@@ -6,7 +6,7 @@ package flume
 import (
 	"bytes"
 	"fmt"
-	"git.apache.org/thrift.git/lib/go/thrift"
+	"github.com/chentao/thrift/lib/go/thrift"
 )
 
 // (needed to ensure safety because of naive import list construction.)
