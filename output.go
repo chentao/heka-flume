@@ -118,20 +118,22 @@ func (o *FlumeOutput) Run(or OutputRunner, h PluginHelper) (err error) {
 	}
 	o.bufferedOut.Start(o, o.boErrorChan, o.boExitChan, stopChan)
 
-	err = o.thriftAppender.Connect()
-	if err != nil {
-		or.LogError(err)
-		return
-	}
-	err = o.thriftAppenderBack.Connect()
-	if err != nil {
-		or.LogError(err)
-		return
-	}
-	defer func() {
-		o.thriftAppender.Disconnect()
-		o.thriftAppenderBack.Disconnect()
-	}()
+	/*
+		err = o.thriftAppender.Connect()
+		if err != nil {
+			or.LogError(err)
+			return
+		}
+		err = o.thriftAppenderBack.Connect()
+		if err != nil {
+			or.LogError(err)
+			return
+		}
+		defer func() {
+			o.thriftAppender.Disconnect()
+			o.thriftAppenderBack.Disconnect()
+		}()
+	*/
 
 	o.backChan = make(chan []byte, 100)
 	go o.backing()
@@ -324,34 +326,55 @@ func (t *ThriftAppender) Disconnect() error {
 	return nil
 }
 
-func (t *ThriftAppender) AppendBatch(batch []*flume.ThriftFlumeEvent) error {
-	status, err := t.client.AppendBatch(batch)
-	if status == flume.Status_OK && err == nil {
-		return nil
+func (t *ThriftAppender) AppendBatch(batch []*flume.ThriftFlumeEvent) (err error) {
+	var status flume.Status
+	if err = t.Connect(); err == nil {
+		status, err = t.client.AppendBatch(batch)
+		if status == flume.Status_OK && err == nil {
+			return nil
+		}
+		if err != nil {
+			t.Disconnect()
+			if err = t.Connect(); err != nil {
+				return fmt.Errorf("AppendBatch fail at reconnect: %v, ", err)
+			}
+		}
 	}
-	t.Disconnect()
-	if err := t.Connect(); err != nil {
-		return fmt.Errorf("AppendBatch fail at reconnect: %v, ", err)
-	}
-	status, err = t.client.AppendBatch(batch)
-	if status == flume.Status_OK && err == nil {
-		return nil
-	}
-	return fmt.Errorf("AppendBatch fail after retry, status:%s, err:%v", status.String(), err)
+
+	return fmt.Errorf("AppendBatch fail, status:%s, err:%v", status.String(), err)
 }
 
-func (t *ThriftAppender) Append(event *flume.ThriftFlumeEvent) error {
-	status, err := t.client.Append(event)
-	if status == flume.Status_OK && err == nil {
-		return nil
+func (t *ThriftAppender) Append(event *flume.ThriftFlumeEvent) (err error) {
+	var status flume.Status
+	if err = t.Connect(); err == nil {
+		status, err = t.client.Append(event)
+		if status == flume.Status_OK && err == nil {
+			return nil
+		}
+		if err != nil {
+			t.Disconnect()
+			if err = t.Connect(); err != nil {
+				return fmt.Errorf("Append fail at reconnect: %v, ", err)
+			}
+		}
 	}
-	t.Disconnect()
-	if err := t.Connect(); err != nil {
-		return fmt.Errorf("Append fail at reconnect: %v, ", err)
-	}
-	status, err = t.client.Append(event)
-	if status == flume.Status_OK && err == nil {
-		return nil
-	}
-	return fmt.Errorf("Append fail after retry, status:%s, err:%v", status.String(), err)
+
+	return fmt.Errorf("Append fail, status:%s, err:%v", status.String(), err)
+	/*
+		status, err := t.client.Append(event)
+		if err != nil {
+			t.Disconnect()
+			if e := t.Connect(); e != nil {
+				return fmt.Errorf("Append fail at reconnect: %v, pre err: %v", e, err)
+			}
+		}
+		if status == flume.Status_OK {
+			return nil
+		}
+		status, err = t.client.Append(event)
+		if status == flume.Status_OK {
+			return nil
+		}
+		return fmt.Errorf("Append fail: status:%s, err:%v", status.String(), err)
+	*/
 }
