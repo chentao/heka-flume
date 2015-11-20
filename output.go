@@ -27,8 +27,9 @@ type FlumeOutput struct {
 	reportLock          sync.Mutex
 	boErrorChan         chan error
 	boExitChan          chan error
-	tClient             *flume.ThriftSourceProtocolClient
 	backChan            chan []byte
+	thriftAppender      *ThriftAppender
+	thriftAppenderBack  *ThriftAppender
 }
 
 type FlumeOutputConfig struct {
@@ -37,8 +38,6 @@ type FlumeOutputConfig struct {
 	ConnectTimeout     uint64 `toml:"connect_timeout"`
 	QueueMaxBufferSize uint64 `toml:"queue_max_buffer_size"`
 	QueueFullAction    string `toml:"queue_full_action"`
-	//RequestTimeout     uint64 `toml:"request_timeout"`
-	//UseBufferingBack   bool   `toml:"use_buffering_back"`
 }
 
 func (o *FlumeOutput) ConfigStruct() interface{} {
@@ -56,38 +55,23 @@ func (o *FlumeOutput) SetName(name string) {
 
 func (o *FlumeOutput) Init(config interface{}) (err error) {
 	o.config = config.(*FlumeOutputConfig)
+	if len(o.config.Address) == 0 {
+		return fmt.Errorf("address must be specified")
+	}
 
 	switch o.config.QueueFullAction {
 	case "shutdown", "drop", "block":
 	default:
 		return fmt.Errorf("`queue_full_action` must be 'shutdown', 'drop', or 'block'")
 	}
-	return
-}
 
-func (o *FlumeOutput) connect(addr string, timeout uint64) (err error) {
-	var tSock *thrift.TSocket
-	tSock, err = thrift.NewTSocketTimeout(addr, time.Duration(timeout)*time.Millisecond)
+	o.thriftAppender, err = NewThriftAppender(o.config.Address, o.config.ConnectTimeout)
 	if err != nil {
-		return
+		return err
 	}
-	var trans *thrift.TFramedTransport
-	trans = thrift.NewTFramedTransport(tSock)
-	protoFactory := thrift.NewTCompactProtocolFactory()
-	o.tClient = flume.NewThriftSourceProtocolClientFactory(trans, protoFactory)
-	if err = o.tClient.Transport.Open(); err != nil {
-		return
-	}
-	return nil
-}
-
-func (o *FlumeOutput) disconnect() (err error) {
-	if o.tClient.Transport != nil {
-		err = o.tClient.Transport.Close()
-		if err != nil {
-			return err
-		}
-		o.tClient.Transport = nil
+	o.thriftAppenderBack, err = NewThriftAppender(o.config.Address, o.config.ConnectTimeout)
+	if err != nil {
+		return err
 	}
 	return
 }
@@ -100,9 +84,12 @@ func (o *FlumeOutput) Run(or OutputRunner, h PluginHelper) (err error) {
 		outBytes []byte
 		stopChan = make(chan bool, 1)
 		e        error
-		outBatch []*flume.ThriftFlumeEvent
 		count    int
+		outBatch []*flume.ThriftFlumeEvent
 	)
+
+	o.boErrorChan = make(chan error, 5)
+	o.boExitChan = make(chan error)
 
 	if or.Encoder() == nil {
 		return errors.New("Encoder must be specified.")
@@ -128,24 +115,26 @@ func (o *FlumeOutput) Run(or OutputRunner, h PluginHelper) (err error) {
 		} else {
 			return
 		}
-		o.bufferedOut.Start(o, o.boErrorChan, o.boExitChan, stopChan)
 	}
+	o.bufferedOut.Start(o, o.boErrorChan, o.boExitChan, stopChan)
 
-	err = o.connect(o.config.Address, o.config.ConnectTimeout)
+	err = o.thriftAppender.Connect()
+	if err != nil {
+		or.LogError(err)
+		return
+	}
+	err = o.thriftAppenderBack.Connect()
 	if err != nil {
 		or.LogError(err)
 		return
 	}
 	defer func() {
-		err = o.disconnect()
-		if err != nil {
-			or.LogError(err)
-			return
-		}
+		o.thriftAppender.Disconnect()
+		o.thriftAppenderBack.Disconnect()
 	}()
 
 	o.backChan = make(chan []byte, 100)
-	go o.backing(stopChan)
+	go o.backing()
 
 	for ok {
 		select {
@@ -164,6 +153,7 @@ func (o *FlumeOutput) Run(or OutputRunner, h PluginHelper) (err error) {
 				default:
 				}
 				<-o.boExitChan
+				close(o.backChan)
 				break
 			}
 
@@ -180,11 +170,12 @@ func (o *FlumeOutput) Run(or OutputRunner, h PluginHelper) (err error) {
 					Body: outBytes,
 				}
 				outBatch = append(outBatch, event)
-				if count++; count > o.config.BatchSize {
+				if count++; count >= o.config.BatchSize {
 					if len(outBatch) > 0 {
 						o.sendBatch(outBatch)
 					}
 					count = 0
+					outBatch = outBatch[:0]
 				}
 			}
 		case err = <-o.boExitChan:
@@ -195,35 +186,40 @@ func (o *FlumeOutput) Run(or OutputRunner, h PluginHelper) (err error) {
 }
 
 func (o *FlumeOutput) sendBatch(batch []*flume.ThriftFlumeEvent) {
-	status, err := o.tClient.AppendBatch(batch)
-	if status != flume.Status_OK {
-		o.or.LogError(fmt.Errorf("flume.AppendBatch fail, start backing: %v", err))
-		for _, event := range batch {
-			o.backChan <- event.Body
-		}
+	if len(batch) == 1 {
+		o.backChan <- batch[0].Body
+		return
 	}
-	atomic.AddInt64(&o.processMessageCount, int64(len(batch)))
+
+	err := o.thriftAppender.AppendBatch(batch)
+	if err == nil {
+		atomic.AddInt64(&o.processMessageCount, int64(len(batch)))
+		return
+	}
+	o.or.LogError(fmt.Errorf("Backing %d events: %v", len(batch), err))
+	for _, event := range batch {
+		o.backChan <- event.Body
+	}
 }
 
 func (o *FlumeOutput) SendRecord(buffer []byte) (err error) {
 	event := &flume.ThriftFlumeEvent{
 		Body: buffer,
 	}
-	status, err := o.tClient.Append(event)
-	if status == flume.Status_OK {
+	err = o.thriftAppenderBack.Append(event)
+	if err == nil {
 		atomic.AddInt64(&o.processMessageCount, 1)
 		return nil
 	}
-	return
+	return fmt.Errorf("SendRecord fail: %v", err)
 }
 
-func (o *FlumeOutput) backing(stopChan chan bool) {
+func (o *FlumeOutput) backing() {
 	for true {
 		select {
-		case <-stopChan:
-			return
 		case backEvent, ok := <-o.backChan:
 			if !ok {
+				o.or.LogMessage("aaa")
 				return
 			}
 			err := o.bufferedOut.QueueBytes(backEvent)
@@ -290,4 +286,72 @@ func (o *FlumeOutput) ReportMsg(msg *message.Message) error {
 	o.bufferedOut.ReportMsg(msg)
 
 	return nil
+}
+
+type ThriftAppender struct {
+	client *flume.ThriftSourceProtocolClient
+}
+
+func NewThriftAppender(addr string, timeout uint64) (*ThriftAppender, error) {
+	tSock, err := thrift.NewTSocketTimeout(addr, time.Duration(timeout)*time.Millisecond)
+	if err != nil {
+		return nil, err
+	}
+	trans := thrift.NewTFramedTransport(tSock)
+	protoFactory := thrift.NewTCompactProtocolFactory()
+	c := flume.NewThriftSourceProtocolClientFactory(trans, protoFactory)
+
+	return &ThriftAppender{
+		client: c,
+	}, nil
+}
+
+func (t *ThriftAppender) Connect() error {
+	if t.client.Transport.IsOpen() {
+		return nil
+	}
+
+	return t.client.Transport.Open()
+}
+
+func (t *ThriftAppender) Disconnect() error {
+	if t.client.Transport != nil {
+		err := t.client.Transport.Close()
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (t *ThriftAppender) AppendBatch(batch []*flume.ThriftFlumeEvent) error {
+	status, err := t.client.AppendBatch(batch)
+	if status == flume.Status_OK && err == nil {
+		return nil
+	}
+	t.Disconnect()
+	if err := t.Connect(); err != nil {
+		return fmt.Errorf("AppendBatch fail at reconnect: %v, ", err)
+	}
+	status, err = t.client.AppendBatch(batch)
+	if status == flume.Status_OK && err == nil {
+		return nil
+	}
+	return fmt.Errorf("AppendBatch fail after retry, status:%s, err:%v", status.String(), err)
+}
+
+func (t *ThriftAppender) Append(event *flume.ThriftFlumeEvent) error {
+	status, err := t.client.Append(event)
+	if status == flume.Status_OK && err == nil {
+		return nil
+	}
+	t.Disconnect()
+	if err := t.Connect(); err != nil {
+		return fmt.Errorf("Append fail at reconnect: %v, ", err)
+	}
+	status, err = t.client.Append(event)
+	if status == flume.Status_OK && err == nil {
+		return nil
+	}
+	return fmt.Errorf("Append fail after retry, status:%s, err:%v", status.String(), err)
 }
