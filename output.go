@@ -118,23 +118,6 @@ func (o *FlumeOutput) Run(or OutputRunner, h PluginHelper) (err error) {
 	}
 	o.bufferedOut.Start(o, o.boErrorChan, o.boExitChan, stopChan)
 
-	/*
-		err = o.thriftAppender.Connect()
-		if err != nil {
-			or.LogError(err)
-			return
-		}
-		err = o.thriftAppenderBack.Connect()
-		if err != nil {
-			or.LogError(err)
-			return
-		}
-		defer func() {
-			o.thriftAppender.Disconnect()
-			o.thriftAppenderBack.Disconnect()
-		}()
-	*/
-
 	o.backChan = make(chan []byte, 100)
 	go o.backing()
 
@@ -222,7 +205,6 @@ func (o *FlumeOutput) backing() {
 		select {
 		case backEvent, ok := <-o.backChan:
 			if !ok {
-				o.or.LogMessage("aaa")
 				return
 			}
 			err := o.bufferedOut.QueueBytes(backEvent)
