@@ -7,50 +7,58 @@ import (
 	"github.com/chentao/thrift/lib/go/thrift"
 	"github.com/mozilla-services/heka/message"
 	. "github.com/mozilla-services/heka/pipeline"
-	"regexp"
-	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
 )
 
+type FBatch struct {
+	queueCursor string
+	count       int64
+	batch       []*flume.ThriftFlumeEvent
+}
+
+type MsgPack struct {
+	bytes       []byte
+	queueCursor string
+}
+
 type FlumeOutput struct {
-	config              *FlumeOutputConfig
-	name                string
-	or                  OutputRunner
-	pConfig             *PipelineConfig
-	bufferedOut         *BufferedOutput
-	processMessageCount int64
-	dropMessageCount    int64
-	backMessageCount    int64
-	rh                  *RetryHelper
-	reportLock          sync.Mutex
-	boErrorChan         chan error
-	boExitChan          chan error
-	backChan            chan []byte
-	thriftAppender      *ThriftAppender
-	thriftAppenderBack  *ThriftAppender
+	config           *FlumeOutputConfig
+	pConfig          *PipelineConfig
+	or               OutputRunner
+	sentMessageCount int64
+	dropMessageCount int64
+	outputBlock      *RetryHelper
+	reportLock       sync.Mutex
+	thriftAppender   *ThriftAppender
+
+	outBatch    []*flume.ThriftFlumeEvent
+	count       int64
+	queueCursor string
+
+	recvChan    chan MsgPack
+	backChan    chan []*flume.ThriftFlumeEvent
+	batchChan   chan FBatch
+	stopChan    chan bool
+	flushTicker *time.Ticker
 }
 
 type FlumeOutputConfig struct {
-	Address            string
-	BatchSize          int    `toml:"batch_size"`
-	ConnectTimeout     uint64 `toml:"connect_timeout"`
-	QueueMaxBufferSize uint64 `toml:"queue_max_buffer_size"`
-	QueueFullAction    string `toml:"queue_full_action"`
+	Address        string
+	BatchSize      int64  `toml:"batch_size"`
+	ConnectTimeout uint64 `toml:"connect_timeout"`
+	UseBuffering   bool   `toml:"use_buffering"`
+	FlushInterval  uint32 `toml:"flush_interval"`
 }
 
 func (o *FlumeOutput) ConfigStruct() interface{} {
 	return &FlumeOutputConfig{
-		BatchSize:          1000,
-		ConnectTimeout:     10000,
-		QueueMaxBufferSize: 0,
-		QueueFullAction:    "block",
+		BatchSize:      1000,
+		ConnectTimeout: 10000,
+		UseBuffering:   true,
+		FlushInterval:  1000,
 	}
-}
-
-func (o *FlumeOutput) SetName(name string) {
-	o.name = name
 }
 
 func (o *FlumeOutput) Init(config interface{}) (err error) {
@@ -59,46 +67,27 @@ func (o *FlumeOutput) Init(config interface{}) (err error) {
 		return fmt.Errorf("address must be specified")
 	}
 
-	switch o.config.QueueFullAction {
-	case "shutdown", "drop", "block":
-	default:
-		return fmt.Errorf("`queue_full_action` must be 'shutdown', 'drop', or 'block'")
-	}
+	o.batchChan = make(chan FBatch)
+	o.backChan = make(chan []*flume.ThriftFlumeEvent, 2)
+	o.recvChan = make(chan MsgPack, 100)
 
 	o.thriftAppender, err = NewThriftAppender(o.config.Address, o.config.ConnectTimeout)
-	if err != nil {
-		return err
-	}
-	o.thriftAppenderBack, err = NewThriftAppender(o.config.Address, o.config.ConnectTimeout)
 	if err != nil {
 		return err
 	}
 	return
 }
 
-func (o *FlumeOutput) Run(or OutputRunner, h PluginHelper) (err error) {
-	var (
-		ok       = true
-		pack     *PipelinePack
-		inChan   = or.InChan()
-		outBytes []byte
-		stopChan = make(chan bool, 1)
-		e        error
-		count    int
-		outBatch []*flume.ThriftFlumeEvent
-	)
-
-	o.boErrorChan = make(chan error, 5)
-	o.boExitChan = make(chan error)
-
+func (o *FlumeOutput) Prepare(or OutputRunner, h PluginHelper) (err error) {
 	if or.Encoder() == nil {
 		return errors.New("Encoder must be specified.")
 	}
 
-	re := regexp.MustCompile("\\W")
-	name := re.ReplaceAllString(or.Name(), "_")
+	o.or = or
+	o.pConfig = h.PipelineConfig()
+	o.stopChan = or.StopChan()
 
-	o.rh, err = NewRetryHelper(RetryOptions{
+	o.outputBlock, err = NewRetryHelper(RetryOptions{
 		MaxDelay:   "5s",
 		MaxRetries: -1,
 	})
@@ -106,150 +95,145 @@ func (o *FlumeOutput) Run(or OutputRunner, h PluginHelper) (err error) {
 		return fmt.Errorf("can't create retry helper: %s", err.Error())
 	}
 
-	o.pConfig = h.PipelineConfig()
-	o.or = or
-	o.bufferedOut, err = NewBufferedOutput("output_queue", name, or, h, o.config.QueueMaxBufferSize)
-	if err != nil {
-		if err == QueueIsFull {
-			or.LogMessage("Queue capacity is already reached.")
-		} else {
-			return
+	o.outBatch = make([]*flume.ThriftFlumeEvent, 0, 10000)
+	go o.committer()
+
+	if o.config.FlushInterval > 0 {
+		d, err := time.ParseDuration(fmt.Sprintf("%dms", o.config.FlushInterval))
+		if err != nil {
+			return fmt.Errorf("can't create flush ticker: %s", err.Error())
 		}
+		o.flushTicker = time.NewTicker(d)
 	}
-	o.bufferedOut.Start(o, o.boErrorChan, o.boExitChan, stopChan)
+	go o.batchSender()
+	return nil
+}
 
-	o.backChan = make(chan []byte, 100)
-	go o.backing()
+func (o *FlumeOutput) ProcessMessage(pack *PipelinePack) (err error) {
+	outBytes, err := o.or.Encode(pack)
+	if err != nil {
+		return fmt.Errorf("can't encode: %s", err)
+	}
 
+	if outBytes != nil {
+		o.recvChan <- MsgPack{bytes: outBytes, queueCursor: pack.QueueCursor}
+	}
+
+	return nil
+}
+
+func (o *FlumeOutput) batchSender() {
+	ok := true
 	for ok {
 		select {
-		case e := <-o.boErrorChan:
-			or.LogError(e)
-		case pack, ok = <-inChan:
-			if !ok {
-				if len(outBatch) > 0 {
-					o.sendBatch(outBatch)
-				}
-				stopChan <- true
-				// Make sure buffer isn't blocked on sending to outputError
-				select {
-				case e := <-o.boErrorChan:
-					or.LogError(e)
-				default:
-				}
-				<-o.boExitChan
-				close(o.backChan)
-				break
+		case <-o.stopChan:
+			ok = false
+			continue
+		case pack := <-o.recvChan:
+			event := &flume.ThriftFlumeEvent{
+				Body: pack.bytes,
 			}
+			o.outBatch = append(o.outBatch, event)
+			o.queueCursor = pack.queueCursor
+			o.count++
+			if len(o.outBatch) > 0 && o.count >= o.config.BatchSize {
+				o.sendBatch()
+			}
+		case <-o.flushTicker.C:
+			if len(o.outBatch) > 0 {
+				o.sendBatch()
+			}
+		}
+	}
+}
 
-			outBytes, e = or.Encode(pack)
-			pack.Recycle()
-			if e != nil {
-				or.LogError(e)
-				atomic.AddInt64(&o.dropMessageCount, 1)
+func (o *FlumeOutput) sendBatch() {
+	b := FBatch{
+		queueCursor: o.queueCursor,
+		count:       o.count,
+		batch:       o.outBatch,
+	}
+	o.count = 0
+	select {
+	case <-o.stopChan:
+		return
+	case o.batchChan <- b:
+	}
+	select {
+	case <-o.stopChan:
+	case o.outBatch = <-o.backChan:
+	}
+}
+
+func (o *FlumeOutput) committer() {
+	o.backChan <- make([]*flume.ThriftFlumeEvent, 0, 10000)
+
+	var b FBatch
+	ok := true
+	for ok {
+		select {
+		case <-o.stopChan:
+			ok = false
+			continue
+		case b, ok = <-o.batchChan:
+			if !ok {
 				continue
 			}
-
-			if outBytes != nil {
-				event := &flume.ThriftFlumeEvent{
-					Body: outBytes,
-				}
-				outBatch = append(outBatch, event)
-				if count++; count >= o.config.BatchSize {
-					if len(outBatch) > 0 {
-						o.sendBatch(outBatch)
-					}
-					count = 0
-					outBatch = outBatch[:0]
-				}
-			}
-		case err = <-o.boExitChan:
-			ok = false
 		}
+		if err := o.sendRecord(b.batch); err != nil {
+			atomic.AddInt64(&o.dropMessageCount, b.count)
+			o.or.LogError(err)
+		} else {
+			atomic.AddInt64(&o.sentMessageCount, b.count)
+		}
+		o.or.UpdateCursor(b.queueCursor)
+		b.batch = b.batch[:0]
+		o.backChan <- b.batch
 	}
-	return
 }
 
-func (o *FlumeOutput) sendBatch(batch []*flume.ThriftFlumeEvent) {
-	if len(batch) == 1 {
-		o.backChan <- batch[0].Body
-		return
-	}
-
+func (o *FlumeOutput) sendRecord(batch []*flume.ThriftFlumeEvent) error {
 	err := o.thriftAppender.AppendBatch(batch)
 	if err == nil {
-		atomic.AddInt64(&o.processMessageCount, int64(len(batch)))
-		return
-	} else {
-		o.or.LogError(fmt.Errorf("Backing %d events: %v", len(batch), err))
-		for _, event := range batch {
-			o.backChan <- event.Body
-		}
-	}
-}
-
-func (o *FlumeOutput) SendRecord(buffer []byte) (err error) {
-	event := &flume.ThriftFlumeEvent{
-		Body: buffer,
-	}
-	err = o.thriftAppenderBack.Append(event)
-	if err == nil {
-		atomic.AddInt64(&o.processMessageCount, 1)
 		return nil
 	}
-	return fmt.Errorf("SendRecord fail: %v", err)
-}
 
-func (o *FlumeOutput) backing() {
-	for true {
+	defer o.outputBlock.Reset()
+	for {
 		select {
-		case backEvent, ok := <-o.backChan:
-			if !ok {
-				return
-			}
-			err := o.bufferedOut.QueueBytes(backEvent)
-			if err == nil {
-				atomic.AddInt64(&o.backMessageCount, 1)
-			} else if err == QueueIsFull {
-				o.or.LogError(err)
-				if !o.queueFull(backEvent, 1) {
-					return
-				}
-			} else if err != nil {
-				o.or.LogError(err)
-				atomic.AddInt64(&o.dropMessageCount, 1)
-			}
+		case <-o.stopChan:
+			return err
+		default:
 		}
+		e := o.outputBlock.Wait()
+		if e != nil {
+			break
+		}
+		err := o.thriftAppender.AppendBatch(batch)
+		if err == nil {
+			break
+		}
+		o.or.LogError(fmt.Errorf("can't AppendBatch: %s", err))
 	}
+	return err
 }
 
-func (o *FlumeOutput) queueFull(buffer []byte, count int64) bool {
-	switch o.config.QueueFullAction {
-	case "block":
-		for o.rh.Wait() == nil {
-			if o.pConfig.Globals.IsShuttingDown() {
-				return false
-			}
-			blockErr := o.bufferedOut.QueueBytes(buffer)
-			if blockErr == nil {
-				atomic.AddInt64(&o.processMessageCount, count)
-				o.rh.Reset()
-				break
-			}
-			select {
-			case e := <-o.boErrorChan:
-				o.or.LogError(e)
-			default:
-			}
-			runtime.Gosched()
-		}
-	case "shutdown":
-		o.pConfig.Globals.ShutDown()
-		return false
-	case "drop":
-		atomic.AddInt64(&o.dropMessageCount, count)
+func (o *FlumeOutput) CleanUp() {
+	if o.flushTicker != nil {
+		o.flushTicker.Stop()
 	}
-	return true
+	o.thriftAppender.Disconnect()
+}
+
+func (o *FlumeOutput) ReportMsg(msg *message.Message) error {
+	o.reportLock.Lock()
+	defer o.reportLock.Unlock()
+
+	message.NewInt64Field(msg, "SentMessageCount",
+		atomic.LoadInt64(&o.sentMessageCount), "count")
+	message.NewInt64Field(msg, "DropMessageCount",
+		atomic.LoadInt64(&o.dropMessageCount), "count")
+	return nil
 }
 
 func init() {
@@ -258,42 +242,17 @@ func init() {
 	})
 }
 
-func (o *FlumeOutput) ReportMsg(msg *message.Message) error {
-	o.reportLock.Lock()
-	defer o.reportLock.Unlock()
-
-	message.NewInt64Field(msg, "ProcessMessageCount",
-		atomic.LoadInt64(&o.processMessageCount), "count")
-	message.NewInt64Field(msg, "DropMessageCount",
-		atomic.LoadInt64(&o.dropMessageCount), "count")
-	message.NewInt64Field(msg, "BackMessageCount",
-		atomic.LoadInt64(&o.backMessageCount), "count")
-	o.bufferedOut.ReportMsg(msg)
-
-	return nil
-}
-
 type ThriftAppender struct {
 	addr    string
 	timeout uint64
 	client  *flume.ThriftSourceProtocolClient
-	rh      *RetryHelper
 }
 
 func NewThriftAppender(addr string, timeout uint64) (*ThriftAppender, error) {
-	rh, err := NewRetryHelper(RetryOptions{
-		MaxDelay:   "5s",
-		MaxRetries: -1,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("can't create retry helper: %s", err.Error())
-	}
-
 	return &ThriftAppender{
 		addr:    addr,
 		timeout: timeout,
 		client:  nil,
-		rh:      rh,
 	}, nil
 }
 
