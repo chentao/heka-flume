@@ -88,7 +88,7 @@ func (o *FlumeOutput) Prepare(or OutputRunner, h PluginHelper) (err error) {
 	o.stopChan = or.StopChan()
 
 	o.outputBlock, err = NewRetryHelper(RetryOptions{
-		MaxDelay:   "5s",
+		MaxDelay:   "10s",
 		MaxRetries: -1,
 	})
 	if err != nil {
@@ -222,7 +222,6 @@ func (o *FlumeOutput) CleanUp() {
 	if o.flushTicker != nil {
 		o.flushTicker.Stop()
 	}
-	o.thriftAppender.Disconnect()
 }
 
 func (o *FlumeOutput) ReportMsg(msg *message.Message) error {
@@ -276,7 +275,7 @@ func (t *ThriftAppender) Connect() error {
 }
 
 func (t *ThriftAppender) Disconnect() error {
-	if t.client.Transport != nil {
+	if t.client.Transport != nil && t.client.Transport.IsOpen() {
 		err := t.client.Transport.Close()
 		if err != nil {
 			return err
