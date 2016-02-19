@@ -20,6 +20,7 @@ type FBatch struct {
 
 type MsgPack struct {
 	bytes       []byte
+	topic       string
 	queueCursor string
 }
 
@@ -45,11 +46,12 @@ type FlumeOutput struct {
 }
 
 type FlumeOutputConfig struct {
-	Address        string
-	BatchSize      int64  `toml:"batch_size"`
-	ConnectTimeout uint64 `toml:"connect_timeout"`
-	UseBuffering   bool   `toml:"use_buffering"`
-	FlushInterval  uint32 `toml:"flush_interval"`
+	Address          string
+	BatchSize        int64  `toml:"batch_size"`
+	ConnectTimeout   uint64 `toml:"connect_timeout"`
+	UseBuffering     bool   `toml:"use_buffering"`
+	FlushInterval    uint32 `toml:"flush_interval"`
+	UseLoggerAsTopic bool   `toml:"use_logger_as_topic"`
 }
 
 func (o *FlumeOutput) ConfigStruct() interface{} {
@@ -116,7 +118,11 @@ func (o *FlumeOutput) ProcessMessage(pack *PipelinePack) (err error) {
 	}
 
 	if outBytes != nil {
-		o.recvChan <- MsgPack{bytes: outBytes, queueCursor: pack.QueueCursor}
+		o.recvChan <- MsgPack{
+			bytes:       outBytes,
+			topic:       pack.Message.GetLogger(),
+			queueCursor: pack.QueueCursor,
+		}
 	}
 
 	return nil
@@ -132,6 +138,10 @@ func (o *FlumeOutput) batchSender() {
 		case pack := <-o.recvChan:
 			event := &flume.ThriftFlumeEvent{
 				Body: pack.bytes,
+			}
+			if o.config.UseLoggerAsTopic {
+				event.Headers = make(map[string]string, 1)
+				event.Headers["topic"] = pack.topic
 			}
 			o.outBatch = append(o.outBatch, event)
 			o.queueCursor = pack.queueCursor
